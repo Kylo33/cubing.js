@@ -8,7 +8,7 @@ import { heykubeConfig } from "./Heykube";
 import { qiyiConfig } from "./qiyi";
 
 const smartPuzzleConfigs = [
-  // ganConfig, /** TODO: fix the filtering, this is VERY temporary. */
+  ganConfig,
   ganGen2Config,
   goCubeConfig,
   heykubeConfig,

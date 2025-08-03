@@ -27,6 +27,8 @@ const Opcodes = Object.freeze({
   DISCONNECT: 13,
 });
 
+const FACE_ORDER = "URFDLB";
+
 /**
  * Decrypt a message from a second generation GAN smart cube.
  * @param message Cube-to-app message, to decrypt
@@ -57,6 +59,52 @@ async function decryptMessage(
   );
 
   return res;
+}
+
+/** A view of a message sent by a GAN Gen2 Smart Cube */
+class GanMessageView {
+  private dataView: DataView;
+  private bitLength: number;
+
+  public constructor(message: Uint8Array) {
+    this.bitLength = message.byteLength * 8;
+    this.dataView = new DataView(
+      new Uint8Array([...message, ...new Array(4).fill(0)]).buffer,
+    );
+  }
+
+  /**
+   * Read a number of bits, as an unsigned integer.
+   * @param start starting index
+   * @param length number of bits to read
+   * @returns unsigned integer representation of those bits
+   */
+  public readBits(start: number, length: number) {
+    if (length < 1 || length > 32) {
+      throw Error(`Length must be in the range [1, 32]: got ${length}`);
+    }
+    if (start + length > this.bitLength) {
+      throw Error(
+        `Tried to read past the end of the message: start + length = ${start + length}, bitLength = ${this.bitLength}`,
+      );
+    }
+    const res = this.dataView.getUint32(Math.floor(start / 8));
+
+    // Number of bits to shift right, due to starting at the nearest byte.
+    // TODO: Clean up this logic
+    const leftBitsToRemove = start - Math.floor(start / 8) * 8;
+    const rightShift = 32 - leftBitsToRemove - length;
+
+    return ((res << leftBitsToRemove) >> leftBitsToRemove) >> rightShift;
+  }
+
+  public toString(): string {
+    let s = "";
+    for (let i = 0; i < this.bitLength / 8; i++) {
+      s += this.dataView.getUint8(i).toString(2).padStart(8, "0");
+    }
+    return s;
+  }
 }
 
 const SALT_LENGTH = 6;
@@ -134,33 +182,33 @@ class GanGen2Cube extends BluetoothPuzzle {
       this.iv,
     );
 
-    // This cube uses big-endian.
-    const messageView = new DataView(message.buffer);
-    const opcode = messageView.getUint8(0) >> 4;
+    const messageView = new GanMessageView(new Uint8Array(message.buffer));
+    const opcode = messageView.readBits(0, 4);
 
     switch (opcode) {
       case Opcodes.GYROSCOPE:
-        console.log("Received gyroscope notification");
         break;
 
-      case Opcodes.MOVE:
-        console.log("Received cube move notification");
+      case Opcodes.MOVE: {
+        const serial = messageView.readBits(4, 8);
+
+        const move = FACE_ORDER[messageView.readBits(12, 4)];
+        const moveIsPrime = messageView.readBits(16, 1);
+
+        console.log(`"Most recent move: ${move}${moveIsPrime ? "'" : ""}`);
         break;
+      }
 
       case Opcodes.FACELETS:
-        console.log("Received cube facelets notification");
         break;
 
       case Opcodes.HARDWARE:
-        console.log("Received cube hardware notification");
         break;
 
       case Opcodes.BATTERY:
-        console.log("Received cube battery notification");
         break;
 
       case Opcodes.DISCONNECT:
-        console.log("Received cube disconnect notification");
         break;
 
       default:
@@ -183,7 +231,6 @@ export const ganGen2Config: BluetoothConfig<BluetoothPuzzle> = {
   filters: [
     {
       namePrefix: "GAN",
-      services: [UUIDs.primaryService],
     },
   ],
   optionalServices: [UUIDs.primaryService],

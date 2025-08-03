@@ -79,8 +79,18 @@ export async function bluetoothConnect<T>(
   const name = server.device?.name || "";
 
   // TODO by reading supported matched filters or provided services.
+  const serviceSet = new Set(
+    (await server.getPrimaryServices()).map((service) => service.uuid),
+  );
 
-  for (const config of configs) {
+  configLoop: for (const config of configs) {
+    // Check whether the optional services exist; we can't just use filters
+    // because they will not all be public until we have connected to the cube.
+    for (const optionalService of config.optionalServices) {
+      if (!serviceSet.has(BluetoothUUID.getService(optionalService))) {
+        continue configLoop;
+      }
+    }
     for (const prefix of config.prefixes) {
       if (name?.startsWith(prefix)) {
         return config.connect(server, device);
