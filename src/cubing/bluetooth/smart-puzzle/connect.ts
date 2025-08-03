@@ -1,13 +1,15 @@
 import { type BluetoothConnectOptions, bluetoothConnect } from "../connect";
 import type { BluetoothPuzzle } from "./bluetooth-puzzle";
 import { ganConfig } from "./gan";
+import { ganGen2Config } from "./gan-gen2";
 import { giiKERConfig } from "./giiker";
 import { goCubeConfig } from "./gocube";
 import { heykubeConfig } from "./Heykube";
 import { qiyiConfig } from "./qiyi";
 
 const smartPuzzleConfigs = [
-  ganConfig,
+  // ganConfig, /** TODO: fix the filtering, this is VERY temporary. */
+  ganGen2Config,
   goCubeConfig,
   heykubeConfig,
   qiyiConfig,

@@ -22,7 +22,7 @@ export async function importKey(
   ]);
 }
 
-async function unsafeEncryptBlockWithIV(
+export async function unsafeEncryptBlockWithIV(
   key: CryptoKey,
   plaintextBlock: ArrayBuffer | Uint8Array,
   iv: ArrayBuffer | Uint8Array,
@@ -48,9 +48,10 @@ export async function unsafeEncryptBlock(
   );
 }
 
-export async function unsafeDecryptBlock(
+export async function unsafeDecryptBlockWithIV(
   key: CryptoKey,
   ciphertextBlock: ArrayBuffer | Uint8Array,
+  iv: ArrayBuffer | Uint8Array,
 ): Promise<ArrayBuffer> {
   const paddingBlock = await unsafeEncryptBlockWithIV(
     key,
@@ -65,10 +66,17 @@ export async function unsafeDecryptBlock(
   const cryptoResult: ArrayBuffer = await window.crypto.subtle.decrypt(
     {
       name: AES_CBC,
-      iv: zeros,
+      iv,
     },
     key,
     cbcCiphertext,
   );
   return cryptoResult.slice(0, blockSize);
+}
+
+export async function unsafeDecryptBlock(
+  key: CryptoKey,
+  ciphertextBlock: ArrayBuffer | Uint8Array,
+): Promise<ArrayBuffer> {
+  return await unsafeDecryptBlockWithIV(key, ciphertextBlock, zeros);
 }

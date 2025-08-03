@@ -439,6 +439,6 @@ export class GanCube extends BluetoothPuzzle {
 export const ganConfig: BluetoothConfig<BluetoothPuzzle> = {
   connect: GanCube.connect.bind(GanCube),
   prefixes: ["GAN"],
-  filters: [{ namePrefix: "GAN" }],
+  filters: [{ namePrefix: "GAN", services: [UUIDs.ganCubeService] }],
   optionalServices: [UUIDs.ganCubeService, UUIDs.infoService],
 };
