@@ -1,5 +1,6 @@
 /* tslint:disable no-bitwise */
 
+import { Move } from "../../alg";
 import {
   type BluetoothConfig,
   BluetoothPuzzle,
@@ -9,23 +10,45 @@ import { puzzles } from "../../puzzles";
 import {
   importKey,
   unsafeDecryptBlockWithIV,
+  unsafeEncryptBlockWithIV,
 } from "../../vendor/public-domain/unsafe-raw-aes/unsafe-raw-aes";
 
-const UUIDs = Object.freeze({
+const UUIDs = {
   primaryService: "6e400001-b5a3-f393-e0a9-e50e24dc4179",
   notifyCharacteristic: "28be4cb6-cd67-11e9-a32f-2a2ae2dbcce4",
   readWriteCharacteristic: "28be4a4a-cd67-11e9-a32f-2a2ae2dbcce4",
   descripterCharacteristic: "00002902-0000-1000-8000-00805F9B34FB",
-});
+} as const;
 
-const Opcodes = Object.freeze({
+const Opcodes = {
   GYROSCOPE: 1,
   MOVE: 2,
   FACELETS: 4,
   HARDWARE: 5,
   BATTERY: 9,
   DISCONNECT: 13,
-});
+} as const;
+
+const Commands = {
+  REQUEST_FACELETS: new Uint8Array([Opcodes.FACELETS, ...Array(19).fill(0)]),
+  REQUEST_HARDWARE: new Uint8Array([Opcodes.HARDWARE, ...Array(19).fill(0)]),
+  REQUEST_BATTERY: new Uint8Array([Opcodes.BATTERY, ...Array(19).fill(0)]),
+  REQUEST_RESET: new Uint8Array([
+    0x0a,
+    0x05,
+    0x39,
+    0x77,
+    0x00,
+    0x00,
+    0x01,
+    0x23,
+    0x45,
+    0x67,
+    0x89,
+    0xab,
+    ...Array(8).fill(0),
+  ]),
+} as const;
 
 const FACE_ORDER = "URFDLB";
 
@@ -34,6 +57,7 @@ const FACE_ORDER = "URFDLB";
  * @param message Cube-to-app message, to decrypt
  * @param key AES-CBC encryption key
  * @param iv AES-CBC initialization vector
+ * @returns Message decrypted with the key and IV (AES-CBC)
  */
 async function decryptMessage(
   message: Uint8Array | ArrayBuffer,
@@ -61,6 +85,40 @@ async function decryptMessage(
   return res;
 }
 
+/**
+ * Encrypt a message to send to a second generation GAN smart cube
+ * @param message App-to-cube message to be encrypted
+ * @param key AES-CBC encryption key
+ * @param iv AES-CBC initialization vector
+ * @returns Message encrypted with the key and IV (AES-CBC)
+ */
+async function encryptMessage(
+  message: Uint8Array | ArrayBuffer,
+  key: CryptoKey,
+  iv: Uint8Array,
+): Promise<Uint8Array<ArrayBufferLike>> {
+  const res = new Uint8Array(message);
+
+  const encryptedBlock = await unsafeEncryptBlockWithIV(
+    key,
+    res.slice(0, 16),
+    iv,
+  );
+  res.set(new Uint8Array(encryptedBlock, 0));
+
+  if (res.length > 16) {
+    const encryptedBlock = await unsafeEncryptBlockWithIV(
+      key,
+      res.slice(res.length - 16, res.length),
+      iv,
+    );
+
+    res.set(new Uint8Array(encryptedBlock), res.length - 16);
+  }
+
+  return res;
+}
+
 /** A view of a message sent by a GAN Gen2 Smart Cube */
 class GanMessageView {
   private dataView: DataView;
@@ -80,22 +138,21 @@ class GanMessageView {
    * @returns unsigned integer representation of those bits
    */
   public readBits(start: number, length: number) {
-    if (length < 1 || length > 32) {
-      throw Error(`Length must be in the range [1, 32]: got ${length}`);
+    if (length < 1 || length > 16) {
+      throw Error(`Length must be in the range [1, 16]: got ${length}`);
     }
     if (start + length > this.bitLength) {
       throw Error(
         `Tried to read past the end of the message: start + length = ${start + length}, bitLength = ${this.bitLength}`,
       );
     }
-    const res = this.dataView.getUint32(Math.floor(start / 8));
+    const res = this.dataView.getUint16(Math.floor(start / 8));
 
-    // Number of bits to shift right, due to starting at the nearest byte.
-    // TODO: Clean up this logic
+    // Number of bits to remove from the left, due to starting at the nearest byte.
     const leftBitsToRemove = start - Math.floor(start / 8) * 8;
-    const rightShift = 32 - leftBitsToRemove - length;
 
-    return ((res << leftBitsToRemove) >> leftBitsToRemove) >> rightShift;
+    const mask = (1 << length) - 1;
+    return (res >>> (16 - length - leftBitsToRemove)) & mask;
   }
 
   public toString(): string {
@@ -109,6 +166,8 @@ class GanMessageView {
 
 const SALT_LENGTH = 6;
 class GanGen2Cube extends BluetoothPuzzle {
+  private lastSerial: number = 0;
+
   public static async connect(
     server: BluetoothRemoteGATTServer,
   ): Promise<BluetoothPuzzle> {
@@ -147,18 +206,14 @@ class GanGen2Cube extends BluetoothPuzzle {
   public constructor(
     private kpuzzle: KPuzzle,
     private server: BluetoothRemoteGATTServer,
-    private aesKey: CryptoKey,
+    private key: CryptoKey,
     private iv: Uint8Array,
   ) {
     super();
-    this.startNotifications();
-    this.server.device.addEventListener(
-      "gattserverdisconnected",
-      this.disconnect.bind(this),
-    );
+    this.startNotifications().then(this.requestCubeInfo.bind(this));
   }
 
-  public async startNotifications() {
+  public async startNotifications(): Promise<void> {
     const mainService = await this.server.getPrimaryService(
       UUIDs.primaryService,
     );
@@ -171,14 +226,19 @@ class GanGen2Cube extends BluetoothPuzzle {
       this.cubeMessageHandler.bind(this),
     );
 
-    notifyCharacteristic.startNotifications();
+    this.server.device.addEventListener(
+      "gattserverdisconnected",
+      this.disconnect.bind(this),
+    );
+
+    await notifyCharacteristic.startNotifications();
   }
 
-  public async cubeMessageHandler(event: Event) {
+  public async cubeMessageHandler(event: Event): Promise<void> {
     const characteristic = event.target as BluetoothRemoteGATTCharacteristic;
     const message = await decryptMessage(
       new Uint8Array(characteristic.value!.buffer),
-      this.aesKey,
+      this.key,
       this.iv,
     );
 
@@ -191,21 +251,33 @@ class GanGen2Cube extends BluetoothPuzzle {
 
       case Opcodes.MOVE: {
         const serial = messageView.readBits(4, 8);
+        const newMoveCount = Math.min((serial - this.lastSerial) & 0xff, 7);
 
-        const move = FACE_ORDER[messageView.readBits(12, 4)];
-        const moveIsPrime = messageView.readBits(16, 1);
+        this.lastSerial = serial;
 
-        console.log(`"Most recent move: ${move}${moveIsPrime ? "'" : ""}`);
+        for (let i = newMoveCount - 1; i >= 0; i--) {
+          const move = FACE_ORDER[messageView.readBits(12 + i * 5, 4)];
+          const moveIsPrime = messageView.readBits(16 + i * 5, 1);
+
+          this.dispatchAlgLeaf({
+            latestAlgLeaf: new Move(move, moveIsPrime ? -1 : 1),
+            timeStamp: Date.now(),
+          });
+        }
+
         break;
       }
 
       case Opcodes.FACELETS:
+        console.log("JUST GOT FACELETS :)");
         break;
 
       case Opcodes.HARDWARE:
+        console.log("JUST GOT HARDWARE :)");
         break;
 
       case Opcodes.BATTERY:
+        console.log("JUST GOT BATTERY :)");
         break;
 
       case Opcodes.DISCONNECT:
@@ -214,6 +286,30 @@ class GanGen2Cube extends BluetoothPuzzle {
       default:
         throw Error("Received non-implemented opcode");
     }
+  }
+
+  public async requestCubeInfo(): Promise<void> {
+    await this.sendCommand("REQUEST_FACELETS");
+    await this.sendCommand("REQUEST_BATTERY");
+    await this.sendCommand("REQUEST_HARDWARE");
+  }
+
+  private async sendCommand(
+    command_type: keyof typeof Commands,
+  ): Promise<Promise<void>> {
+    const message = Commands[command_type];
+
+    const readWriteCharacteristicPromise = this.server
+      .getPrimaryService(UUIDs.primaryService)
+      .then((primaryService) =>
+        primaryService.getCharacteristic(UUIDs.readWriteCharacteristic),
+      );
+    const [encryptedMessage, readWriteCharacteristic] = await Promise.all([
+      encryptMessage(message, this.key, this.iv),
+      readWriteCharacteristicPromise,
+    ]);
+
+    await readWriteCharacteristic.writeValue(encryptedMessage);
   }
 
   public override disconnect(): void {
