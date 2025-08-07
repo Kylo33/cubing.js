@@ -5,7 +5,7 @@ import {
   type BluetoothConfig,
   BluetoothPuzzle,
 } from "../../bluetooth/smart-puzzle/bluetooth-puzzle";
-import type { KPuzzle } from "../../kpuzzle";
+import { KPattern, type KPatternData, type KPuzzle } from "../../kpuzzle";
 import { puzzles } from "../../puzzles";
 import {
   importKey,
@@ -119,6 +119,41 @@ async function encryptMessage(
   return res;
 }
 
+/**
+ * Creates {@link KPatternData} from Gan Gen2 Facelet data.
+ * @param cp Gan Gen2 facelet corner permutation list (all 8 values; i.e. including the calculated value)
+ * @param co Gan Gen2 facelet corner orientation list (all 8 values; i.e. including the calculated value)
+ * @param ep Gan Gen2 facelet edge permutation list (all 12 values; i.e. including the calculated value)
+ * @param eo Gan Gen2 facelet edge orientation list (all 12 values; i.e. including the calculated value)
+ */
+function patternDataFromGanFacelets(
+  cp: number[],
+  co: number[],
+  ep: number[],
+  eo: number[],
+): KPatternData {
+  const toGanCornerMap = [0, 3, 2, 1, 4, 5, 6, 7];
+  const toGanEdgeMap = [1, 0, 3, 2, 5, 4, 7, 6, 8, 9, 11, 10];
+
+  const patternData: KPatternData = {
+    CORNERS: {
+      pieces: toGanCornerMap.map((ganIndex) => toGanCornerMap[cp[ganIndex]]),
+      orientation: toGanCornerMap.map((ganIndex) => co[ganIndex]),
+    },
+    EDGES: {
+      pieces: toGanEdgeMap.map((ganIndex) => toGanEdgeMap[ep[ganIndex]]),
+      orientation: toGanEdgeMap.map((ganIndex) => eo[ganIndex]),
+    },
+    CENTERS: {
+      pieces: [0, 1, 2, 3, 4, 5],
+      orientation: [0, 0, 0, 0, 0, 0],
+      orientationMod: [1, 1, 1, 1, 1, 1],
+    },
+  };
+
+  return patternData;
+}
+
 /** A view of a message sent by a GAN Gen2 Smart Cube */
 class GanMessageView {
   private dataView: DataView;
@@ -164,9 +199,21 @@ class GanMessageView {
   }
 }
 
+type Resolvers = {
+  [opcode in keyof typeof Commands]: () => void;
+};
+
 const SALT_LENGTH = 6;
 class GanGen2Cube extends BluetoothPuzzle {
-  private lastSerial: number = 0;
+  private lastSerial: number = -1;
+  private batteryLevel: number = 100;
+  private pattern: KPattern;
+  // TODO: Are these necessary?
+  private _hardwareVersion: string | undefined;
+  private _softwareVersion: string | undefined;
+  private _hardwareName: string | undefined;
+  private _initialPromise;
+  private _resolvers: Resolvers = {};
 
   public static async connect(
     server: BluetoothRemoteGATTServer,
@@ -194,13 +241,19 @@ class GanGen2Cube extends BluetoothPuzzle {
       iv[i] = (iv[i] + salt[i]) % 0xff;
     }
 
-    const aesKey = await importKey(aesKeyArr);
-    return new GanGen2Cube(
+    const key = await importKey(aesKeyArr);
+    const cube = new GanGen2Cube(
       await puzzles["3x3x3"].kpuzzle(),
       server,
-      aesKey,
+      key,
       iv,
     );
+
+    // Start notifications and request info
+    // from the cube before returning the cube
+    await cube.initialPromise;
+
+    return cube;
   }
 
   public constructor(
@@ -210,7 +263,10 @@ class GanGen2Cube extends BluetoothPuzzle {
     private iv: Uint8Array,
   ) {
     super();
-    this.startNotifications().then(this.requestCubeInfo.bind(this));
+    this.pattern = kpuzzle.defaultPattern();
+    this._initialPromise = this.startNotifications().then(
+      this.requestCubeInfo.bind(this),
+    );
   }
 
   public async startNotifications(): Promise<void> {
@@ -251,6 +307,10 @@ class GanGen2Cube extends BluetoothPuzzle {
 
       case Opcodes.MOVE: {
         const serial = messageView.readBits(4, 8);
+        if (serial === -1) {
+          break;
+        }
+
         const newMoveCount = Math.min((serial - this.lastSerial) & 0xff, 7);
 
         this.lastSerial = serial;
@@ -259,36 +319,100 @@ class GanGen2Cube extends BluetoothPuzzle {
           const move = FACE_ORDER[messageView.readBits(12 + i * 5, 4)];
           const moveIsPrime = messageView.readBits(16 + i * 5, 1);
 
+          const newMove = new Move(move, moveIsPrime ? -1 : 1);
+          this.pattern = this.pattern.applyMove(newMove);
           this.dispatchAlgLeaf({
-            latestAlgLeaf: new Move(move, moveIsPrime ? -1 : 1),
-            timeStamp: Date.now(),
+            latestAlgLeaf: newMove,
+            timeStamp: Date.now(), // TODO: Find correct timestamp
           });
         }
 
         break;
       }
 
-      case Opcodes.FACELETS:
-        console.log("JUST GOT FACELETS :)");
-        break;
+      case Opcodes.FACELETS: {
+        const serial = messageView.readBits(4, 8);
+        if (this.lastSerial === -1) {
+          this.lastSerial = serial;
+        }
 
-      case Opcodes.HARDWARE:
-        console.log("JUST GOT HARDWARE :)");
+        const ganCp = [];
+        const ganCo = [];
+        const ganEp = [];
+        const ganEo = [];
+
+        let cpSum = 0;
+        let coSum = 0;
+
+        for (let i = 0; i < 7; i++) {
+          const cp = messageView.readBits(12 + i * 3, 3);
+          const co = messageView.readBits(33 + i * 2, 2);
+
+          cpSum += cp;
+          coSum += co;
+
+          ganCp.push(cp);
+          ganCo.push(co);
+        }
+
+        ganCp.push(28 - cpSum);
+        ganCo.push((3 - (coSum % 3)) % 3);
+
+        let epSum = 0;
+        let eoSum = 0;
+
+        for (let i = 0; i < 11; i++) {
+          const ep = messageView.readBits(47 + i * 4, 4);
+          const eo = messageView.readBits(91 + i, 1);
+
+          epSum += ep;
+          eoSum += eo;
+
+          ganEp.push(ep);
+          ganEo.push(eo);
+        }
+
+        ganEp.push(66 - epSum);
+        ganEo.push((2 - (eoSum % 2)) % 2);
+
+        this.pattern = new KPattern(
+          this.kpuzzle,
+          patternDataFromGanFacelets(ganCp, ganCo, ganEp, ganEo),
+        );
+
         break;
+      }
+
+      case Opcodes.HARDWARE: {
+        const hwMajor = messageView.readBits(8, 8);
+        const hwMinor = messageView.readBits(16, 8);
+        const swMajor = messageView.readBits(24, 8);
+        const swMinor = messageView.readBits(32, 8);
+
+        let hwName = "";
+        for (let i = 0; i < 8; i++) {
+          hwName += String.fromCharCode(messageView.readBits(40 + i * 8, 8));
+        }
+
+        this._hardwareVersion = `${hwMajor}.${hwMinor}`;
+        this._softwareVersion = `${swMajor}.${swMinor}`;
+        this._hardwareName = hwName;
+
+        break;
+      }
 
       case Opcodes.BATTERY:
-        console.log("JUST GOT BATTERY :)");
+        this.batteryLevel = Math.min(messageView.readBits(8, 8), 100);
         break;
 
       case Opcodes.DISCONNECT:
+        this.disconnect();
         break;
-
-      default:
-        throw Error("Received non-implemented opcode");
     }
   }
 
   public async requestCubeInfo(): Promise<void> {
+    // TODO: Delay promise resolving until this data is retrieved
     await this.sendCommand("REQUEST_FACELETS");
     await this.sendCommand("REQUEST_BATTERY");
     await this.sendCommand("REQUEST_HARDWARE");
@@ -312,12 +436,36 @@ class GanGen2Cube extends BluetoothPuzzle {
     await readWriteCharacteristic.writeValue(encryptedMessage);
   }
 
+  public override async getPattern(): Promise<KPattern> {
+    return this.pattern;
+  }
+
   public override disconnect(): void {
     this.server.disconnect();
   }
 
   public override name(): string | undefined {
     return this.server.device.name;
+  }
+
+  public getBattery(): number {
+    return this.batteryLevel;
+  }
+
+  get initialPromise(): Promise<void> {
+    return this._initialPromise;
+  }
+
+  get softwareVersion(): string | undefined {
+    return this._softwareVersion;
+  }
+
+  get hardwareVersion(): string | undefined {
+    return this._hardwareVersion;
+  }
+
+  get hardwareName(): string | undefined {
+    return this._hardwareName;
   }
 }
 
