@@ -29,6 +29,8 @@ const Opcodes = {
   DISCONNECT: 13,
 } as const;
 
+type Opcode = (typeof Opcodes)[keyof typeof Opcodes];
+
 const Commands = {
   REQUEST_FACELETS: new Uint8Array([Opcodes.FACELETS, ...Array(19).fill(0)]),
   REQUEST_HARDWARE: new Uint8Array([Opcodes.HARDWARE, ...Array(19).fill(0)]),
@@ -49,6 +51,15 @@ const Commands = {
     ...Array(8).fill(0),
   ]),
 } as const;
+
+type Command = keyof typeof Commands;
+
+const opcodeResolves: Record<Command, Opcode | undefined> = {
+  REQUEST_FACELETS: Opcodes.FACELETS,
+  REQUEST_HARDWARE: Opcodes.HARDWARE,
+  REQUEST_BATTERY: Opcodes.BATTERY,
+  REQUEST_RESET: undefined,
+};
 
 const FACE_ORDER = "URFDLB";
 
@@ -156,14 +167,12 @@ function patternDataFromGanFacelets(
 
 /** A view of a message sent by a GAN Gen2 Smart Cube */
 class GanMessageView {
-  private dataView: DataView;
-  private bitLength: number;
+  private stringView: string;
 
   public constructor(message: Uint8Array) {
-    this.bitLength = message.byteLength * 8;
-    this.dataView = new DataView(
-      new Uint8Array([...message, ...new Array(4).fill(0)]).buffer,
-    );
+    this.stringView = Array.from(message)
+      .map((byte) => byte.toString(2).padStart(8, "0"))
+      .join("");
   }
 
   /**
@@ -173,47 +182,27 @@ class GanMessageView {
    * @returns unsigned integer representation of those bits
    */
   public readBits(start: number, length: number) {
-    if (length < 1 || length > 16) {
-      throw Error(`Length must be in the range [1, 16]: got ${length}`);
-    }
-    if (start + length > this.bitLength) {
-      throw Error(
-        `Tried to read past the end of the message: start + length = ${start + length}, bitLength = ${this.bitLength}`,
-      );
-    }
-    const res = this.dataView.getUint16(Math.floor(start / 8));
-
-    // Number of bits to remove from the left, due to starting at the nearest byte.
-    const leftBitsToRemove = start - Math.floor(start / 8) * 8;
-
-    const mask = (1 << length) - 1;
-    return (res >>> (16 - length - leftBitsToRemove)) & mask;
+    return parseInt(this.stringView.slice(start, start + length), 2);
   }
 
   public toString(): string {
-    let s = "";
-    for (let i = 0; i < this.bitLength / 8; i++) {
-      s += this.dataView.getUint8(i).toString(2).padStart(8, "0");
-    }
-    return s;
+    return this.stringView;
   }
 }
 
-type Resolvers = {
-  [opcode in keyof typeof Commands]: () => void;
-};
-
 const SALT_LENGTH = 6;
+const MAXIMUM_RESPONSE_WAIT_TIME = 5000;
 class GanGen2Cube extends BluetoothPuzzle {
   private lastSerial: number = -1;
   private batteryLevel: number = 100;
   private pattern: KPattern;
+  private resolvers: Map<Opcode, () => void> = new Map();
+  private cubeTimestamp = -1;
+  private _initialPromise;
   // TODO: Are these necessary?
   private _hardwareVersion: string | undefined;
   private _softwareVersion: string | undefined;
   private _hardwareName: string | undefined;
-  private _initialPromise;
-  private _resolvers: Resolvers = {};
 
   public static async connect(
     server: BluetoothRemoteGATTServer,
@@ -299,7 +288,7 @@ class GanGen2Cube extends BluetoothPuzzle {
     );
 
     const messageView = new GanMessageView(new Uint8Array(message.buffer));
-    const opcode = messageView.readBits(0, 4);
+    const opcode = messageView.readBits(0, 4) as Opcode;
 
     switch (opcode) {
       case Opcodes.GYROSCOPE:
@@ -309,6 +298,13 @@ class GanGen2Cube extends BluetoothPuzzle {
         const serial = messageView.readBits(4, 8);
         if (serial === -1) {
           break;
+        }
+
+        if (this.cubeTimestamp === -1) {
+          this.cubeTimestamp = Date.now();
+        } else {
+          const elapsed = messageView.readBits(47, 16);
+          this.cubeTimestamp += elapsed;
         }
 
         const newMoveCount = Math.min((serial - this.lastSerial) & 0xff, 7);
@@ -323,7 +319,7 @@ class GanGen2Cube extends BluetoothPuzzle {
           this.pattern = this.pattern.applyMove(newMove);
           this.dispatchAlgLeaf({
             latestAlgLeaf: newMove,
-            timeStamp: Date.now(), // TODO: Find correct timestamp
+            timeStamp: this.cubeTimestamp,
           });
         }
 
@@ -409,13 +405,20 @@ class GanGen2Cube extends BluetoothPuzzle {
         this.disconnect();
         break;
     }
+
+    const resolver = this.resolvers.get(opcode) || (() => null);
+    resolver();
+    this.resolvers.delete(opcode);
   }
 
   public async requestCubeInfo(): Promise<void> {
-    // TODO: Delay promise resolving until this data is retrieved
-    await this.sendCommand("REQUEST_FACELETS");
-    await this.sendCommand("REQUEST_BATTERY");
-    await this.sendCommand("REQUEST_HARDWARE");
+    try {
+      await this.sendCommand("REQUEST_FACELETS");
+      await this.sendCommand("REQUEST_BATTERY");
+      await this.sendCommand("REQUEST_HARDWARE");
+    } catch (err) {
+      throw Error(`Failed requests for cube info: ${err}`);
+    }
   }
 
   private async sendCommand(
@@ -434,6 +437,19 @@ class GanGen2Cube extends BluetoothPuzzle {
     ]);
 
     await readWriteCharacteristic.writeValue(encryptedMessage);
+
+    // If this command causes the cube to send a notification,
+    // wait until the notification is processed before returning.
+    const resolvingOpcode = opcodeResolves[command_type];
+    if (resolvingOpcode !== undefined) {
+      await new Promise((resolve, reject) => {
+        this.resolvers.set(resolvingOpcode, () => resolve(undefined));
+        setTimeout(
+          () => reject(`Cube did not respond to command '${command_type}'`),
+          MAXIMUM_RESPONSE_WAIT_TIME,
+        );
+      });
+    }
   }
 
   public override async getPattern(): Promise<KPattern> {
