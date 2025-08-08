@@ -4,6 +4,7 @@ import { Move } from "../../alg";
 import {
   type BluetoothConfig,
   BluetoothPuzzle,
+  type ConnectionArguments,
 } from "../../bluetooth/smart-puzzle/bluetooth-puzzle";
 import { KPattern, type KPatternData, type KPuzzle } from "../../kpuzzle";
 import { puzzles } from "../../puzzles";
@@ -212,6 +213,7 @@ class GanMessageView {
 
 const SALT_LENGTH = 6;
 const MAXIMUM_RESPONSE_WAIT_TIME = 5000;
+/** @category Smart Puzzles */
 class GanGen2Cube extends BluetoothPuzzle {
   private lastSerial: number = -1;
   private batteryLevel: number = 100;
@@ -223,9 +225,10 @@ class GanGen2Cube extends BluetoothPuzzle {
   private _initialPromise;
   private _resolvers: Map<Opcode, () => void> = new Map();
 
-  public static async connect(
-    server: BluetoothRemoteGATTServer,
-  ): Promise<BluetoothPuzzle> {
+  public static async connect({
+    server,
+    requestMacAddress,
+  }: ConnectionArguments): Promise<BluetoothPuzzle> {
     const aesKeyArr = new Uint8Array([
       0x01, 0x02, 0x42, 0x28, 0x31, 0x91, 0x16, 0x07, 0x20, 0x05, 0x18, 0x54,
       0x42, 0x11, 0x12, 0x53,
@@ -235,14 +238,16 @@ class GanGen2Cube extends BluetoothPuzzle {
       0x32, 0x12, 0x02, 0x43,
     ]);
 
-    // TODO: Automatically retrieve MAC address with .watchAdvertisements()
-    const mac = "FE:97:F0:52:F5:F4";
-    const salt = new Uint8Array(
-      mac
-        .split(":")
-        .map((macSegment: string) => parseInt(macSegment, 16))
-        .reverse(),
-    );
+    const mac = await requestMacAddress();
+    const salt =
+      typeof mac === "string"
+        ? new Uint8Array(
+            mac
+              .split(":")
+              .map((macSegment: string) => parseInt(macSegment, 16))
+              .reverse(),
+          )
+        : mac.reverse();
 
     for (let i = 0; i < SALT_LENGTH; i++) {
       aesKeyArr[i] = (aesKeyArr[i] + salt[i]) % 0xff;
