@@ -29,6 +29,8 @@ const Opcodes = {
   DISCONNECT: 13,
 } as const;
 
+type Opcode = (typeof Opcodes)[keyof typeof Opcodes];
+
 const Commands = {
   REQUEST_FACELETS: new Uint8Array([Opcodes.FACELETS, ...Array(19).fill(0)]),
   REQUEST_HARDWARE: new Uint8Array([Opcodes.HARDWARE, ...Array(19).fill(0)]),
@@ -49,6 +51,15 @@ const Commands = {
     ...Array(8).fill(0),
   ]),
 } as const;
+
+type Command = keyof typeof Commands;
+
+const opcodeResolves: Record<Command, Opcode | undefined> = {
+  REQUEST_FACELETS: Opcodes.FACELETS,
+  REQUEST_HARDWARE: Opcodes.HARDWARE,
+  REQUEST_BATTERY: Opcodes.BATTERY,
+  REQUEST_RESET: undefined,
+};
 
 const FACE_ORDER = "URFDLB";
 
@@ -199,11 +210,8 @@ class GanMessageView {
   }
 }
 
-type Resolvers = {
-  [opcode in keyof typeof Commands]: () => void;
-};
-
 const SALT_LENGTH = 6;
+const MAXIMUM_RESPONSE_WAIT_TIME = 5000;
 class GanGen2Cube extends BluetoothPuzzle {
   private lastSerial: number = -1;
   private batteryLevel: number = 100;
@@ -213,7 +221,7 @@ class GanGen2Cube extends BluetoothPuzzle {
   private _softwareVersion: string | undefined;
   private _hardwareName: string | undefined;
   private _initialPromise;
-  private _resolvers: Resolvers = {};
+  private _resolvers: Map<Opcode, () => void> = new Map();
 
   public static async connect(
     server: BluetoothRemoteGATTServer,
@@ -299,7 +307,7 @@ class GanGen2Cube extends BluetoothPuzzle {
     );
 
     const messageView = new GanMessageView(new Uint8Array(message.buffer));
-    const opcode = messageView.readBits(0, 4);
+    const opcode = messageView.readBits(0, 4) as Opcode;
 
     switch (opcode) {
       case Opcodes.GYROSCOPE:
@@ -409,13 +417,20 @@ class GanGen2Cube extends BluetoothPuzzle {
         this.disconnect();
         break;
     }
+
+    const resolver = this._resolvers.get(opcode) || (() => null);
+    resolver();
+    this._resolvers.delete(opcode);
   }
 
   public async requestCubeInfo(): Promise<void> {
-    // TODO: Delay promise resolving until this data is retrieved
-    await this.sendCommand("REQUEST_FACELETS");
-    await this.sendCommand("REQUEST_BATTERY");
-    await this.sendCommand("REQUEST_HARDWARE");
+    try {
+      await this.sendCommand("REQUEST_FACELETS");
+      await this.sendCommand("REQUEST_BATTERY");
+      await this.sendCommand("REQUEST_HARDWARE");
+    } catch (err) {
+      throw Error(`Failed requests for cube info: ${err}`);
+    }
   }
 
   private async sendCommand(
@@ -434,6 +449,19 @@ class GanGen2Cube extends BluetoothPuzzle {
     ]);
 
     await readWriteCharacteristic.writeValue(encryptedMessage);
+
+    // If this command causes the cube to send a notification,
+    // wait until the notification is processed before returning.
+    const resolvingOpcode = opcodeResolves[command_type];
+    if (resolvingOpcode !== undefined) {
+      await new Promise((resolve, reject) => {
+        this._resolvers.set(resolvingOpcode, () => resolve(undefined));
+        setTimeout(
+          () => reject(`Cube did not respond to command '${command_type}'`),
+          MAXIMUM_RESPONSE_WAIT_TIME,
+        );
+      });
+    }
   }
 
   public override async getPattern(): Promise<KPattern> {
