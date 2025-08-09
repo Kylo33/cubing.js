@@ -131,6 +131,16 @@ async function encryptMessage(
 }
 
 /**
+ * Converts one quaternion value from the GAN cube to one that
+ * can be dispatched with {@link BluetoothPuzzle.dispatchOrientation}
+ * @param ganValue quaternion value from the GAN cube
+ * @returns converted value
+ */
+function convertQuaternion(ganValue: number): number {
+  return ((1 - (ganValue >> 15) * 2) * (ganValue & 0x7fff)) / 0x7fff;
+}
+
+/**
  * Creates {@link KPatternData} from Gan Gen2 Facelet data.
  * @param cp Gan Gen2 facelet corner permutation list (all 8 values; i.e. including the calculated value)
  * @param co Gan Gen2 facelet corner orientation list (all 8 values; i.e. including the calculated value)
@@ -291,8 +301,21 @@ class GanGen2Cube extends BluetoothPuzzle {
     const opcode = messageView.readBits(0, 4) as Opcode;
 
     switch (opcode) {
-      case Opcodes.GYROSCOPE:
+      case Opcodes.GYROSCOPE: {
+        const quaternion = {
+          w: convertQuaternion(messageView.readBits(4, 16)),
+          x: convertQuaternion(messageView.readBits(20, 16)),
+          y: convertQuaternion(messageView.readBits(36, 16)),
+          z: convertQuaternion(messageView.readBits(52, 16)),
+        };
+
+        this.dispatchOrientation({
+          quaternion,
+          timeStamp: this.cubeTimestamp,
+        });
+
         break;
+      }
 
       case Opcodes.MOVE: {
         const serial = messageView.readBits(4, 8);
